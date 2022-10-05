@@ -1,0 +1,275 @@
+#include <HttpClient.h>
+#include <b64.h>
+
+#include <EEPROM.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ArduinoOTA.h>
+#include <iostream>
+#include <string>
+#include "Fetch.h"
+
+// Configuration for fallback access point 
+// if Wi-Fi connection fails.
+const char * AP_ssid = "ESP8266_fallback_AP";
+const char * AP_password = "SuperSecretPassword";
+IPAddress AP_IP = IPAddress(10,1,1,1);
+IPAddress AP_subnet = IPAddress(255,255,255,0);
+const char* serverName = "http://192.168.1.106:1880/update-sensor";
+const int ledpin = 5;
+
+String DeviceId = "0";
+const int addrOffset = 350;
+
+void handleRoot();              // function prototypes for HTTP handlers
+void handleLED();
+void handleNotFound();
+
+// Wi-Fi connection parameters.
+// It will be read from the flash during setup.
+struct WifiConf {
+  char wifi_ssid[50];
+  char wifi_password[50];
+  // Make sure that there is a 0 
+  // that terminatnes the c string
+  // if memory is not initalized yet.
+  char cstr_terminator = 0; // makse sure
+};
+WifiConf wifiConf;
+
+// Web server for editing configuration.
+// 80 is the default http port.
+ESP8266WebServer server(80);
+
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Booting...");
+  pinMode(ledpin, OUTPUT);
+  // init EEPROM object 
+  // to read/write wifi configuration.
+  EEPROM.begin(512);
+  
+  readWifiConf();
+
+  if (!connectToWiFi()) {
+    setUpAccessPoint();
+  }
+  setUpWebServer();
+  setUpOverTheAirProgramming();
+}
+
+void readWifiConf() {
+  // Read wifi conf from flash
+  for (int i=0; i<sizeof(wifiConf); i++) {
+    ((char *)(&wifiConf))[i] = char(EEPROM.read(i));
+  }
+  // Make sure that there is a 0 
+  // that terminatnes the c string
+  // if memory is not initalized yet.
+  wifiConf.cstr_terminator = 0;
+}
+
+
+void writeWifiConf() {
+  for (int i=0; i<sizeof(wifiConf); i++) {
+    EEPROM.write(i, ((char *)(&wifiConf))[i]);
+  }
+  EEPROM.commit();
+}
+
+String readDeviceId() {
+  int newStrLen = EEPROM.read(addrOffset);
+  char data[newStrLen + 1];
+  for (int i = 0; i < newStrLen; i++)
+  {
+    data[i] = EEPROM.read(addrOffset + 1 + i);
+  }
+  data[newStrLen] = '\0'; // !!! NOTE !!! Remove the space between the slash "/" and "0" (I've added a space because otherwise there is a display bug)
+  return String(data);
+}
+
+
+void writeDeviceId(String strToWrite) {
+  byte len = strToWrite.length();
+  EEPROM.write(addrOffset, len);
+  for (int i = 0; i < len; i++)
+  {
+    EEPROM.write(addrOffset + 1 + i, strToWrite[i]);
+  }
+  EEPROM.commit();
+}
+
+void checkForDeviceId(){
+  DeviceId = readDeviceId();
+  if(DeviceId.equals("") || DeviceId.equals("0")){
+    DeviceId = createNewDevice();
+    writeDeviceId(DeviceId);
+  }
+  Serial.println("Device Id: " + DeviceId);
+}
+
+bool connectToWiFi() {
+  Serial.printf("Connecting to '%s'\n", wifiConf.wifi_ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiConf.wifi_ssid, wifiConf.wifi_password);
+  if (WiFi.waitForConnectResult() == WL_CONNECTED) {
+    Serial.print("Connected. IP: ");
+    Serial.println(WiFi.localIP());
+    checkForDeviceId();
+    return true;
+  } else {
+    Serial.println("Connection Failed!");
+    return false;
+  }
+
+}
+
+void setUpAccessPoint() {
+    Serial.println("Setting up access point.");
+    Serial.printf("SSID: %s\n", AP_ssid);
+    Serial.printf("Password: %s\n", AP_password);
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAPConfig(AP_IP, AP_IP, AP_subnet);
+    if (WiFi.softAP(AP_ssid, AP_password)) {
+      Serial.print("Ready. Access point IP: ");
+      Serial.println(WiFi.softAPIP());
+    } else {
+      Serial.println("Setting up access point failed!");
+    }
+}
+
+void setUpWebServer() {
+  server.on("/", handleWebServerRequest);
+  server.on("/LED", HTTP_POST, handleLED);  // Call the 'handleLED' function when a POST request is made to URI "/LED"
+  server.on("/GetDeviceId", HTTP_GET, GetDeviceId);
+  //server.on("/SetDeviceId", HTTP_POST, SetDeviceId);  // Call the 'handleLED' function when a POST request is made to URI "/LED"
+  server.onNotFound(handleNotFound);        // When a client requests an unknown URI (i.e. something other than "/"), call function "handleNotFound"
+
+  server.begin();
+}
+
+void handleWebServerRequest() {
+  bool save = false;
+
+  if (server.hasArg("ssid") && server.hasArg("password")) {
+    server.arg("ssid").toCharArray(
+      wifiConf.wifi_ssid,
+      sizeof(wifiConf.wifi_ssid));
+    server.arg("password").toCharArray(
+      wifiConf.wifi_password,
+      sizeof(wifiConf.wifi_password));
+
+    Serial.println(server.arg("ssid"));
+    Serial.println(wifiConf.wifi_ssid);
+
+    writeWifiConf();
+    save = true;
+
+  }else{
+  String message = "";
+    message += "<!DOCTYPE html>";
+    message += "<html>";
+    message += "<head>";
+    message += "<title>ESP8266 conf</title>";
+    message += "</head>";
+    message += "<body>";
+    if (save) {
+    server.send(200, "text/html", "<form action=\"/LED\" method=\"POST\"><input type=\"submit\" value=\"Toggle LED\"></form>");
+    } else {
+      message += "<h1>Wi-Fi conf</h1>";
+      message += "<form action='/' method='POST'>";
+      message += "<div>SSID:</div>";
+      message += "<div><input type='text' name='ssid' value='" + String(wifiConf.wifi_ssid) + "'/></div>";
+      message += "<div>Password:</div>";
+      message += "<div><input type='password' name='password' value='" + String(wifiConf.wifi_password) + "'/></div>";
+      message += "<div><input type='submit' value='Save'/></div>";
+      message += "</form>";
+    }
+    message += "</body>";
+    message += "</html>";
+    server.send(200, "text/html", message);
+
+    if (save) {
+      delay(1000);
+      ESP.restart();
+    }
+  }
+
+  
+}
+
+String createNewDevice(){
+  // Setting request options.
+    String body = "\""+WiFi.localIP().toString()+"\"";
+    RequestOptions options;
+    options.method = "POST";
+    options.headers["Content-Type"] = "application/json";
+    options.headers["Content-Length"] = String(body.length());
+    options.headers["Ocp-Apim-Subscription-Key"] = "93906a14a54a451fbbaf47f2d97e2078";
+
+    options.body = body;
+
+    // Making the request.
+    Response response = fetch("https://homeapimanager.azure-api.net/v1/api/Device", options);
+    String r = response.text();
+    Serial.println("Fetched Value: " + r);
+
+    return r.substring(1,4);
+}
+
+
+void setUpOverTheAirProgramming() {
+
+  // Change OTA port. 
+  // Default: 8266
+  // ArduinoOTA.setPort(8266);
+
+  // Change the name of how it is going to 
+  // show up in Arduino IDE.
+  // Default: esp8266-[ChipID]
+  // ArduinoOTA.setHostname("myesp8266");
+
+  // Re-programming passowrd. 
+  // No password by default.
+  // ArduinoOTA.setPassword("123");
+
+  ArduinoOTA.begin();
+}
+
+
+void loop() {
+  // Give processing time for ArduinoOTA.
+  // This must be called regularly
+  // for the Over-The-Air upload to work.
+  ArduinoOTA.handle();
+
+  // Give processing time for the webserver.
+  // This must be called regularly
+  // for the webserver to work.
+  server.handleClient();
+}
+
+void handleLED() {                          // If a POST request is made to URI /LED
+  digitalWrite(ledpin,!digitalRead(ledpin));      // Change the state of the LED
+  Serial.println("LED ON!");
+  server.sendHeader("Location","/");        // Add a header to respond with a new location for the browser to go to the home page again
+  server.send(303);                         // Send it back to the browser with an HTTP status 303 (See Other) to redirect
+}
+
+void GetDeviceId() {                          // If a POST request is made to URI /LED
+  if(DeviceId == "0"){
+    readDeviceId();
+    server.send(200, "text/json", "{id : " + (String)DeviceId);
+  }else{
+    server.send(200, "text/json", "{id : " + (String)DeviceId);
+  }
+
+}
+
+void handleNotFound(){
+  server.send(404, "text/plain", "404: Not found"); // Send HTTP status 404 (Not Found) when there's no handler for the URI in the request
+}
+
